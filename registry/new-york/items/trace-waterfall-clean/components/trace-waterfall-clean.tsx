@@ -3,9 +3,9 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 
 /*
- * Trace Waterfall (Clean) – A timeline of an agent run: how long each agent, model call
- * and tool took, what it cost and where it failed.
- * Matches affectUI New York Clean specification (.ui-trwc).
+ * Trace Waterfall, clean style – Where the time and cost of a run go.
+ * Container-query responsive, WAI-ARIA tree + dialog, live clock via startedAt/now.
+ * Chevron, warning and close icons use Hugeicons Free SVG paths (MIT, hugeicons.com).
  */
 
 export type TraceSpanKind = "agent" | "subagent" | "llm" | "tool";
@@ -20,14 +20,14 @@ export type TraceSpan = {
   start: number;
   /** Offset in ms from the start of the run – omit while status is "running" */
   end?: number;
-  /** Short note shown next to the name, e.g. "12 hits" or "src/auth/session.ts" */
+  /** Short muted note shown next to the name */
   detail?: string;
   /** Optional custom icon for the span row */
   icon?: ReactNode;
   model?: string;
   tokensIn?: number;
   tokensOut?: number;
-  /** Cost in USD (or custom unit via formatCost) */
+  /** Span's own cost – containers sum children automatically */
   cost?: number;
   input?: string;
   output?: string;
@@ -35,12 +35,33 @@ export type TraceSpan = {
   children?: TraceSpan[];
 };
 
+export type TraceSummaryMetric = {
+  label: string;
+  value: string | number;
+  tone?: "default" | "danger" | "warn" | "ok";
+};
+
+export type TraceWaterfallLabels = {
+  spanColumn?: string;
+  live?: string;
+  done?: string;
+  failed?: string;
+  slowest?: string;
+  duration?: string;
+  cost?: string;
+  tokens?: string;
+  input?: string;
+  output?: string;
+  error?: string;
+  close?: string;
+};
+
 export type TraceWaterfallProps = {
   /** Root span of the trace – its children form the tree */
   root: TraceSpan;
-  /** Current run clock in ms from the start – omit to let running traces tick on their own */
+  /** Current run clock in ms from the start – omit when using startedAt or settled traces */
   now?: number;
-  /** Wall-clock timestamp (ms or Date.now()) when the run started – drives the live timer */
+  /** Wall-clock timestamp (epoch ms) when the run started – drives the live timer */
   startedAt?: number;
   /** Controlled list of folded span ids */
   collapsed?: string[];
@@ -52,8 +73,10 @@ export type TraceWaterfallProps = {
   /** Initially open span id (uncontrolled) */
   defaultOpenId?: string | null;
   onOpenChange?: (id: string | null, span?: TraceSpan) => void;
-  /** Marks the slowest leaf or sub-span with a badge */
+  /** Marks the slowest finished span with a small Slowest tag */
   markSlowest?: boolean;
+  /** "leaf" (default, official spec) picks slowest finished LLM/tool call; "stage" picks slowest depth-1 step */
+  slowestScope?: "leaf" | "stage";
   /** Minimum axis length in ms so short runs don't stretch edge to edge */
   minRange?: number;
   /** Formats a cost number – defaults to USD ("$0.042") */
@@ -62,21 +85,25 @@ export type TraceWaterfallProps = {
   formatDuration?: (ms: number) => string;
   /** Heading in the top bar */
   title?: string;
+  /** Optional domain summary cells overriding the 6 default AI trace stats */
+  summaryItems?: TraceSummaryMetric[];
+  /** Optional UI text overrides */
+  labels?: TraceWaterfallLabels;
   className?: string;
 };
 
 type FlatRow = {
   span: TraceSpan;
   depth: number;
+  parentId?: string;
   hasChildren: boolean;
   isExpanded: boolean;
-  guides: boolean[];
 };
 
 function defaultFormatCost(amount: number): string {
   if (amount === 0) return "$0.00";
   if (amount < 0.01) return `$${amount.toFixed(3)}`;
-  if (amount < 1) return `$${amount.toFixed(3)}`;
+  if (amount < 1) return `$${amount.toFixed(2)}`;
   return `$${amount.toFixed(2)}`;
 }
 
@@ -104,6 +131,50 @@ function collectAllSpans(span: TraceSpan, out: TraceSpan[] = []): TraceSpan[] {
   return out;
 }
 
+/** Cluster folded child start percentages so dense branches show clean, legible ticks. */
+function buildFoldTicks(
+  parent: TraceSpan,
+  durMs: number,
+  barWidthPct: number,
+): { id: string; leftPct: number; name: string; kind: TraceSpanKind; status: TraceSpanStatus }[] {
+  if (!parent.children || parent.children.length === 0 || barWidthPct < 3.5) {
+    return [];
+  }
+  const raw = parent.children.map((child) => {
+    const cStart = Math.max(0, child.start - parent.start);
+    const pct = durMs > 0 ? Math.min(92, Math.max(4, (cStart / durMs) * 100)) : 50;
+    return { id: child.id, leftPct: pct, name: child.name, kind: child.kind, status: child.status };
+  });
+  raw.sort((a, b) => a.leftPct - b.leftPct);
+
+  const maxTicks = barWidthPct < 10 ? 3 : barWidthPct < 20 ? 5 : 7;
+  const minGap = 92 / Math.max(2, maxTicks);
+  const clustered: typeof raw = [];
+  for (const item of raw) {
+    const prev = clustered[clustered.length - 1];
+    if (!prev || item.leftPct - prev.leftPct >= minGap) {
+      clustered.push(item);
+    }
+    if (clustered.length >= maxTicks) break;
+  }
+  return clustered;
+}
+
+function computeOwnOrSubCost(span: TraceSpan): number | undefined {
+  if (typeof span.cost === "number") return span.cost;
+  if (!span.children || span.children.length === 0) return undefined;
+  let total = 0;
+  let hasAny = false;
+  for (const ch of span.children) {
+    const sub = computeOwnOrSubCost(ch);
+    if (typeof sub === "number") {
+      total += sub;
+      hasAny = true;
+    }
+  }
+  return hasAny ? total : undefined;
+}
+
 export function TraceWaterfall({
   root,
   now: controlledNow,
@@ -115,10 +186,13 @@ export function TraceWaterfall({
   defaultOpenId = null,
   onOpenChange,
   markSlowest = true,
+  slowestScope = "leaf",
   minRange = 10000,
   formatCost = defaultFormatCost,
   formatDuration: customFormatDuration,
   title = "Trace",
+  summaryItems,
+  labels,
   className,
 }: TraceWaterfallProps) {
   const fmtDuration = customFormatDuration ?? defaultFormatDuration;
@@ -126,6 +200,21 @@ export function TraceWaterfall({
   const [internalOpenId, setInternalOpenId] = useState<string | null>(defaultOpenId);
   const [focusId, setFocusId] = useState<string>(root.id);
   const rowRefs = useRef<Record<string, HTMLDivElement | null>>({});
+
+  const text = {
+    spanColumn: labels?.spanColumn ?? "SPAN",
+    live: labels?.live ?? "Live",
+    done: labels?.done ?? "Done",
+    failed: labels?.failed ?? "Failed",
+    slowest: labels?.slowest ?? "SLOWEST",
+    duration: labels?.duration ?? "Duration",
+    cost: labels?.cost ?? "Cost",
+    tokens: labels?.tokens ?? "Tokens",
+    input: labels?.input ?? "INPUT",
+    output: labels?.output ?? "OUTPUT",
+    error: labels?.error ?? "ERROR",
+    close: labels?.close ?? "Close details",
+  };
 
   const collapsedSet = useMemo(
     () => new Set(controlledCollapsed ?? internalCollapsed),
@@ -149,7 +238,7 @@ export function TraceWaterfall({
 
   const [tickNow, setTickNow] = useState<number>(() => {
     if (controlledNow !== undefined) return controlledNow;
-    if (startedAt !== undefined) return Math.max(maxEnd, Date.now() - startedAt);
+    if (startedAt !== undefined && hasRunning) return Math.max(maxEnd, Date.now() - startedAt);
     return maxEnd;
   });
 
@@ -158,22 +247,21 @@ export function TraceWaterfall({
       setTickNow(controlledNow);
       return;
     }
-    if (!hasRunning) {
+    if (!hasRunning || startedAt === undefined) {
       setTickNow(maxEnd);
       return;
     }
-    const baseWall = startedAt ?? Date.now() - maxEnd;
     const id = window.setInterval(() => {
-      setTickNow(Math.max(maxEnd, Date.now() - baseWall));
+      setTickNow(Math.max(maxEnd, Date.now() - startedAt));
     }, 100);
     return () => window.clearInterval(id);
   }, [controlledNow, hasRunning, maxEnd, startedAt]);
 
   const effectiveNow = controlledNow ?? tickNow;
 
-  // Compute aggregate stats from leaf spans (or spans with direct metrics)
   const summary = useMemo(() => {
     let cost = 0;
+    let hasCost = false;
     let tokensIn = 0;
     let tokensOut = 0;
     let llmCalls = 0;
@@ -183,13 +271,20 @@ export function TraceWaterfall({
     for (const s of allSpans) {
       const isLeaf = !s.children || s.children.length === 0;
       if (isLeaf || s.kind === "llm" || s.kind === "tool") {
-        if (typeof s.cost === "number") cost += s.cost;
+        if (typeof s.cost === "number") {
+          cost += s.cost;
+          hasCost = true;
+        }
         if (typeof s.tokensIn === "number") tokensIn += s.tokensIn;
         if (typeof s.tokensOut === "number") tokensOut += s.tokensOut;
       }
       if (s.kind === "llm") llmCalls += 1;
       if (s.kind === "tool") toolCalls += 1;
       if (s.status === "failed") errors += 1;
+    }
+
+    if (!hasCost && typeof root.cost === "number") {
+      cost = root.cost;
     }
 
     const rootEnd = root.end ?? effectiveNow;
@@ -204,23 +299,36 @@ export function TraceWaterfall({
     };
   }, [allSpans, root, effectiveNow]);
 
-  // Find slowest non-root span
   const slowestId = useMemo(() => {
     if (!markSlowest) return null;
-    let bestId: string | null = null;
-    let bestDur = -1;
+    if (slowestScope === "stage") {
+      let bestId: string | null = null;
+      let bestDur = -1;
+      for (const s of root.children ?? []) {
+        const dur = (s.end ?? effectiveNow) - s.start;
+        if (dur > bestDur) {
+          bestDur = dur;
+          bestId = s.id;
+        }
+      }
+      return bestId;
+    }
+
+    let bestLeafId: string | null = null;
+    let bestLeafDur = -1;
     for (const s of allSpans) {
       if (s.id === root.id) continue;
-      const dur = (s.end ?? effectiveNow) - s.start;
-      if (dur > bestDur) {
-        bestDur = dur;
-        bestId = s.id;
+      if (s.kind !== "llm" && s.kind !== "tool") continue;
+      if (s.status === "running" || s.end === undefined) continue;
+      const dur = s.end - s.start;
+      if (dur > bestLeafDur) {
+        bestLeafDur = dur;
+        bestLeafId = s.id;
       }
     }
-    return bestId;
-  }, [allSpans, root.id, effectiveNow, markSlowest]);
+    return bestLeafId;
+  }, [allSpans, root, effectiveNow, markSlowest, slowestScope]);
 
-  // Axis range & round ticks
   const axisRange = useMemo(() => {
     const raw = Math.max(minRange, maxEnd, effectiveNow);
     const step =
@@ -239,21 +347,17 @@ export function TraceWaterfall({
     return { max: ceil, ticks };
   }, [minRange, maxEnd, effectiveNow]);
 
-  // Flatten visible tree rows
   const rows = useMemo(() => {
     const list: FlatRow[] = [];
-    const walk = (span: TraceSpan, depth: number, guides: boolean[]) => {
+    const walk = (span: TraceSpan, depth: number, parentId?: string) => {
       const hasChildren = Boolean(span.children && span.children.length > 0);
       const isExpanded = hasChildren && !collapsedSet.has(span.id);
-      list.push({ span, depth, hasChildren, isExpanded, guides });
+      list.push({ span, depth, parentId, hasChildren, isExpanded });
       if (hasChildren && isExpanded && span.children) {
-        const len = span.children.length;
-        span.children.forEach((child, idx) => {
-          walk(child, depth + 1, [...guides, idx < len - 1]);
-        });
+        for (const child of span.children) walk(child, depth + 1, span.id);
       }
     };
-    walk(root, 0, []);
+    walk(root, 0, undefined);
     return list;
   }, [root, collapsedSet]);
 
@@ -278,7 +382,7 @@ export function TraceWaterfall({
   );
 
   const handleTreeKeyDown = (e: KeyboardEvent<HTMLDivElement>, idx: number, row: FlatRow) => {
-    const { span, hasChildren, isExpanded } = row;
+    const { span, parentId, hasChildren, isExpanded } = row;
     if (e.key === "ArrowDown") {
       e.preventDefault();
       const next = rows[idx + 1];
@@ -319,6 +423,9 @@ export function TraceWaterfall({
       e.preventDefault();
       if (hasChildren && isExpanded) {
         toggleCollapse(span.id);
+      } else if (parentId) {
+        setFocusId(parentId);
+        rowRefs.current[parentId]?.focus();
       }
     } else if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
@@ -326,19 +433,41 @@ export function TraceWaterfall({
     } else if (e.key === "Escape" && openId) {
       e.preventDefault();
       selectOpen(null);
+      rowRefs.current[span.id]?.focus();
     }
   };
 
-  const overallStatus: TraceSpanStatus = summary.errors > 0
-    ? "failed"
-    : hasRunning
-      ? "running"
-      : root.status;
+  const overallStatus: TraceSpanStatus =
+    root.status === "failed" || summary.errors > 0
+      ? "failed"
+      : hasRunning
+        ? "running"
+        : root.status;
 
+  const showNowMarker = hasRunning && (startedAt !== undefined || controlledNow !== undefined);
   const nowPct = Math.min(100, Math.max(0, (effectiveNow / axisRange.max) * 100));
 
+  const computedSummary: TraceSummaryMetric[] = summaryItems ?? [
+    { label: "DURATION", value: fmtDuration(summary.duration) },
+    { label: "COST", value: formatCost(summary.cost) },
+    { label: "TOKENS", value: formatTokens(summary.tokens) },
+    { label: "LLM CALLS", value: summary.llmCalls },
+    { label: "TOOL CALLS", value: summary.toolCalls },
+    { label: "ERRORS", value: summary.errors, tone: summary.errors > 0 ? "danger" : "default" },
+  ];
+
   return (
-    <div className={["ui-trwc", className].filter(Boolean).join(" ")}>
+    <div
+      className={["ui-trwc", className].filter(Boolean).join(" ")}
+      onKeyDown={(e) => {
+        if (e.key === "Escape" && openId) {
+          e.preventDefault();
+          const currentId = openId;
+          selectOpen(null);
+          rowRefs.current[currentId]?.focus();
+        }
+      }}
+    >
       <style href="ui-trace-waterfall-clean" precedence="default">
         {css}
       </style>
@@ -346,14 +475,9 @@ export function TraceWaterfall({
       {/* Top Header Bar */}
       <div className="ui-trwc__top">
         <div className="ui-trwc__top-left">
-          <span className="ui-trwc__spark" aria-hidden="true">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
-              <path
-                d="M8 1.5L9.6 6.4L14.5 8L9.6 9.6L8 14.5L6.4 9.6L1.5 8L6.4 6.4L8 1.5Z"
-                stroke="currentColor"
-                strokeWidth="1.4"
-                strokeLinejoin="round"
-              />
+          <span className="ui-trwc__spark" data-status={overallStatus} aria-hidden="true">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M8 1.5L9.45 6.55L14.5 8L9.45 9.45L8 14.5L6.55 9.45L1.5 8L6.55 6.55L8 1.5Z" />
             </svg>
           </span>
           <h3 className="ui-trwc__title">{title}</h3>
@@ -363,66 +487,56 @@ export function TraceWaterfall({
             </span>
           )}
         </div>
-        <span className="ui-trwc__status" data-status={overallStatus}>
+        <span
+          className="ui-trwc__status"
+          data-status={overallStatus}
+          role="status"
+          aria-live="polite"
+        >
           <span className="ui-trwc__status-dot" aria-hidden="true" />
           {overallStatus === "running"
-            ? "Live"
+            ? text.live
             : overallStatus === "failed"
-              ? "Failed"
-              : "Done"}
+              ? text.failed
+              : text.done}
         </span>
       </div>
 
       {/* 6-Column Summary Strip */}
       <div className="ui-trwc__stats">
-        <div className="ui-trwc__stat">
-          <span className="ui-trwc__stat-label">DURATION</span>
-          <span className="ui-trwc__stat-val">{fmtDuration(summary.duration)}</span>
-        </div>
-        <div className="ui-trwc__stat">
-          <span className="ui-trwc__stat-label">COST</span>
-          <span className="ui-trwc__stat-val">{formatCost(summary.cost)}</span>
-        </div>
-        <div className="ui-trwc__stat">
-          <span className="ui-trwc__stat-label">TOKENS</span>
-          <span className="ui-trwc__stat-val">{formatTokens(summary.tokens)}</span>
-        </div>
-        <div className="ui-trwc__stat">
-          <span className="ui-trwc__stat-label">LLM CALLS</span>
-          <span className="ui-trwc__stat-val">{summary.llmCalls}</span>
-        </div>
-        <div className="ui-trwc__stat">
-          <span className="ui-trwc__stat-label">TOOL CALLS</span>
-          <span className="ui-trwc__stat-val">{summary.toolCalls}</span>
-        </div>
-        <div className="ui-trwc__stat">
-          <span className="ui-trwc__stat-label">ERRORS</span>
-          <span
-            className="ui-trwc__stat-val"
-            data-error={summary.errors > 0 || undefined}
-          >
-            {summary.errors}
-          </span>
-        </div>
+        {computedSummary.map((item) => (
+          <div key={item.label} className="ui-trwc__stat">
+            <span className="ui-trwc__stat-label">{item.label}</span>
+            <span
+              className="ui-trwc__stat-val"
+              data-tone={item.tone !== "default" ? item.tone : undefined}
+              data-live={hasRunning && startedAt !== undefined ? "true" : undefined}
+            >
+              {item.value}
+            </span>
+          </div>
+        ))}
       </div>
 
       {/* Column Header + Time Axis */}
       <div className="ui-trwc__axis-head">
-        <div className="ui-trwc__col-span">SPAN</div>
+        <div className="ui-trwc__col-span">{text.spanColumn}</div>
         <div className="ui-trwc__col-timeline">
-          {axisRange.ticks.map((tick) => {
+          {axisRange.ticks.map((tick, tIdx) => {
             const pct = (tick / axisRange.max) * 100;
+            const isFirst = tIdx === 0;
             return (
               <span
                 key={tick}
                 className="ui-trwc__tick-label"
-                style={{ left: `${pct}%` }}
+                data-first={isFirst || undefined}
+                style={{ left: isFirst ? "8px" : `${pct}%` }}
               >
                 {tick === 0 && !customFormatDuration ? "0s" : fmtDuration(tick)}
               </span>
             );
           })}
-          {hasRunning && (
+          {showNowMarker && (
             <span
               className="ui-trwc__now-head"
               style={{ left: `${nowPct}%` }}
@@ -441,11 +555,14 @@ export function TraceWaterfall({
           const leftPct = Math.min(100, Math.max(0, (span.start / axisRange.max) * 100));
           const widthPct = Math.min(
             100 - leftPct,
-            Math.max(0.8, (durMs / axisRange.max) * 100),
+            Math.max(1.25, (durMs / axisRange.max) * 100),
           );
           const isSlowest = slowestId === span.id;
           const isSelected = openId === span.id;
           const isFocused = focusId === span.id;
+          const displayCost = span.id === root.id ? span.cost ?? computeOwnOrSubCost(span) : computeOwnOrSubCost(span);
+          const foldTicks =
+            hasChildren && !isExpanded ? buildFoldTicks(span, durMs, widthPct) : [];
 
           return (
             <div
@@ -457,10 +574,12 @@ export function TraceWaterfall({
               aria-level={depth + 1}
               aria-expanded={hasChildren ? isExpanded : undefined}
               aria-selected={isSelected}
+              aria-label={`${span.name} ${span.status} ${fmtDuration(durMs)}${typeof displayCost === "number" && displayCost > 0 ? ` ${formatCost(displayCost)}` : ""}`}
               tabIndex={isFocused ? 0 : -1}
               className="ui-trwc__row"
               data-selected={isSelected || undefined}
               data-status={span.status}
+              data-parent={hasChildren || undefined}
               onClick={() => {
                 setFocusId(span.id);
                 selectOpen(isSelected ? null : span.id);
@@ -470,14 +589,13 @@ export function TraceWaterfall({
               {/* Left Span Label Cell */}
               <div
                 className="ui-trwc__cell-span"
-                style={{ paddingLeft: `${12 + depth * 18}px` }}
+                style={{ paddingLeft: `${12 + depth * 16}px` }}
               >
-                {/* Vertical tree guides */}
                 {Array.from({ length: depth }).map((_, gIdx) => (
                   <span
                     key={gIdx}
                     className="ui-trwc__guide"
-                    style={{ left: `${19 + gIdx * 18}px` }}
+                    style={{ left: `${18 + gIdx * 16}px` }}
                     aria-hidden="true"
                   />
                 ))}
@@ -493,20 +611,21 @@ export function TraceWaterfall({
                       toggleCollapse(span.id);
                     }}
                   >
+                    {/* Hugeicons ArrowRight01 path (MIT) */}
                     <svg
-                      width="10"
-                      height="10"
-                      viewBox="0 0 10 10"
+                      width="11"
+                      height="11"
+                      viewBox="0 0 24 24"
+                      fill="none"
                       style={{
                         transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
-                        transition: "transform 140ms ease",
+                        transition: "transform 150ms cubic-bezier(0.22, 1, 0.36, 1)",
                       }}
                     >
                       <path
-                        d="M3.2 2L6.8 5L3.2 8"
-                        fill="none"
+                        d="M9 6L15 12L9 18"
                         stroke="currentColor"
-                        strokeWidth="1.4"
+                        strokeWidth="2.1"
                         strokeLinecap="round"
                         strokeLinejoin="round"
                       />
@@ -542,17 +661,18 @@ export function TraceWaterfall({
 
               {/* Right Timeline Bar Cell */}
               <div className="ui-trwc__cell-timeline">
-                {/* Grid lines */}
-                {axisRange.ticks.map((tick) => (
-                  <span
-                    key={tick}
-                    className="ui-trwc__gridline"
-                    style={{ left: `${(tick / axisRange.max) * 100}%` }}
-                    aria-hidden="true"
-                  />
-                ))}
+                {axisRange.ticks.map((tick, tIdx) =>
+                  tIdx === 0 ? null : (
+                    <span
+                      key={tick}
+                      className="ui-trwc__gridline"
+                      style={{ left: `${(tick / axisRange.max) * 100}%` }}
+                      aria-hidden="true"
+                    />
+                  ),
+                )}
 
-                {hasRunning && (
+                {showNowMarker && (
                   <span
                     className="ui-trwc__now-line"
                     style={{ left: `${nowPct}%` }}
@@ -560,7 +680,7 @@ export function TraceWaterfall({
                   />
                 )}
 
-                {/* Span bar */}
+                {/* Translucent bordered capsule bar */}
                 <div
                   className="ui-trwc__bar-wrap"
                   style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
@@ -570,21 +690,16 @@ export function TraceWaterfall({
                     data-kind={span.kind}
                     data-status={span.status}
                   >
-                    {/* When folded, render child spans as small tick marks inside the parent bar */}
-                    {hasChildren &&
-                      !isExpanded &&
-                      span.children?.map((child) => {
-                        const cStart = Math.max(0, child.start - span.start);
-                        const cPct = durMs > 0 ? Math.min(98, (cStart / durMs) * 100) : 0;
-                        return (
-                          <span
-                            key={child.id}
-                            className="ui-trwc__fold-tick"
-                            style={{ left: `${cPct}%` }}
-                            title={child.name}
-                          />
-                        );
-                      })}
+                    {foldTicks.map((ft) => (
+                      <span
+                        key={ft.id}
+                        className="ui-trwc__fold-tick"
+                        data-kind={ft.kind}
+                        data-status={ft.status}
+                        style={{ left: `${ft.leftPct}%` }}
+                        title={ft.name}
+                      />
+                    ))}
                   </div>
                 </div>
 
@@ -594,11 +709,14 @@ export function TraceWaterfall({
                   style={{ left: `calc(${leftPct + widthPct}% + 8px)` }}
                 >
                   <span className="ui-trwc__bar-dur">{fmtDuration(durMs)}</span>
-                  {typeof span.cost === "number" && span.cost > 0 && (
-                    <span className="ui-trwc__bar-cost">{formatCost(span.cost)}</span>
+                  {typeof displayCost === "number" && displayCost > 0 && (
+                    <>
+                      <span className="ui-trwc__bar-sep" aria-hidden="true">·</span>
+                      <span className="ui-trwc__bar-cost">{formatCost(displayCost)}</span>
+                    </>
                   )}
                   {isSlowest && (
-                    <span className="ui-trwc__slowest">SLOWEST</span>
+                    <span className="ui-trwc__slowest">{text.slowest}</span>
                   )}
                 </div>
               </div>
@@ -624,38 +742,50 @@ export function TraceWaterfall({
                 <KindGlyph kind={openSpan.kind} status={openSpan.status} />
               </span>
               <strong className="ui-trwc__dialog-title">{openSpan.name}</strong>
-              <span className="ui-trwc__dialog-badge" data-kind={openSpan.kind}>
-                {openSpan.kind.toUpperCase()}
-              </span>
+              {openSpan.detail && (
+                <span className="ui-trwc__dialog-model">{openSpan.detail}</span>
+              )}
               {openSpan.model && (
-                <span className="ui-trwc__dialog-model">{openSpan.model}</span>
+                <span className="ui-trwc__dialog-badge">{openSpan.model}</span>
               )}
             </div>
             <button
               type="button"
               className="ui-trwc__dialog-close"
-              aria-label="Close details"
-              onClick={() => selectOpen(null)}
+              aria-label={text.close}
+              onClick={() => {
+                const currentId = openSpan.id;
+                selectOpen(null);
+                rowRefs.current[currentId]?.focus();
+              }}
             >
-              ×
+              {/* Hugeicons Cancel01 path (MIT) */}
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path
+                  d="M18 6L6 18M6 6L18 18"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                />
+              </svg>
             </button>
           </div>
 
           <div className="ui-trwc__dialog-metrics">
             <span>
-              Duration:{" "}
+              {text.duration}:{" "}
               <strong>
                 {fmtDuration((openSpan.end ?? effectiveNow) - openSpan.start)}
               </strong>
             </span>
-            {typeof openSpan.cost === "number" && (
+            {typeof openSpan.cost === "number" && openSpan.cost > 0 && (
               <span>
-                Cost: <strong>{formatCost(openSpan.cost)}</strong>
+                {text.cost}: <strong>{formatCost(openSpan.cost)}</strong>
               </span>
             )}
             {(openSpan.tokensIn !== undefined || openSpan.tokensOut !== undefined) && (
               <span>
-                Tokens:{" "}
+                {text.tokens}:{" "}
                 <strong>
                   {openSpan.tokensIn ?? 0} in → {openSpan.tokensOut ?? 0} out
                 </strong>
@@ -665,21 +795,21 @@ export function TraceWaterfall({
 
           {openSpan.error && (
             <div className="ui-trwc__dialog-block ui-trwc__dialog-block--error">
-              <div className="ui-trwc__dialog-label">ERROR</div>
+              <div className="ui-trwc__dialog-label">{text.error}</div>
               <pre className="ui-trwc__dialog-pre">{openSpan.error}</pre>
             </div>
           )}
 
           {openSpan.input && (
             <div className="ui-trwc__dialog-block">
-              <div className="ui-trwc__dialog-label">INPUT</div>
+              <div className="ui-trwc__dialog-label">{text.input}</div>
               <pre className="ui-trwc__dialog-pre">{openSpan.input}</pre>
             </div>
           )}
 
           {openSpan.output && (
             <div className="ui-trwc__dialog-block">
-              <div className="ui-trwc__dialog-label">OUTPUT</div>
+              <div className="ui-trwc__dialog-label">{text.output}</div>
               <pre className="ui-trwc__dialog-pre">{openSpan.output}</pre>
             </div>
           )}
@@ -691,45 +821,34 @@ export function TraceWaterfall({
 
 function KindGlyph({ kind, status }: { kind: TraceSpanKind; status: TraceSpanStatus }) {
   if (status === "failed") {
+    /* Hugeicons AlertCircle path (MIT) */
     return (
-      <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
-        <path
-          d="M6 3.5V6.5M6 8.5H6.01M10.5 6A4.5 4.5 0 1 1 1.5 6a4.5 4.5 0 0 1 9 0Z"
-          stroke="currentColor"
-          strokeWidth="1.3"
-          strokeLinecap="round"
-        />
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="12" r="9.2" stroke="currentColor" strokeWidth="1.9" />
+        <path d="M12 8V12.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+        <circle cx="12" cy="16" r="1" fill="currentColor" />
       </svg>
     );
   }
   if (kind === "llm") {
     return (
-      <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
-        <path
-          d="M6 1.5L7.1 4.9L10.5 6L7.1 7.1L6 10.5L4.9 7.1L1.5 6L4.9 4.9L6 1.5Z"
-          stroke="currentColor"
-          strokeWidth="1.2"
-          strokeLinejoin="round"
-        />
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
+        <path d="M8 1.5L9.45 6.55L14.5 8L9.45 9.45L8 14.5L6.55 9.45L1.5 8L6.55 6.55L8 1.5Z" />
       </svg>
     );
   }
   if (kind === "tool") {
     return (
-      <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
-        <path
-          d="M7.5 2.5a2.2 2.2 0 0 0-2.1 2.8L2.2 8.5a.9.9 0 0 0 1.3 1.3l3.2-3.2a2.2 2.2 0 0 0 2.8-2.1L8.2 5.8 6.8 4.4l1.3-1.3Z"
-          stroke="currentColor"
-          strokeWidth="1.15"
-          strokeLinejoin="round"
-        />
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+        <circle cx="11" cy="11" r="6.5" stroke="currentColor" strokeWidth="1.9" />
+        <path d="M16 16L20 20" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
       </svg>
     );
   }
   return (
-    <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
-      <circle cx="6" cy="6" r="3.8" stroke="currentColor" strokeWidth="1.3" />
-      <circle cx="6" cy="6" r="1.4" fill="currentColor" />
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+      <circle cx="8" cy="8" r="5" stroke="currentColor" strokeWidth="1.5" />
+      <circle cx="8" cy="8" r="2" fill="currentColor" />
     </svg>
   );
 }
@@ -737,25 +856,39 @@ function KindGlyph({ kind, status }: { kind: TraceSpanKind; status: TraceSpanSta
 const css = /* css */ `
 .ui-trwc {
   --trwc-bg: var(--aui-surface, #ffffff);
-  --trwc-surface: var(--aui-subtle, rgba(20, 20, 22, 0.04));
+  --trwc-surface: var(--aui-subtle, rgba(15, 23, 42, 0.024));
   --trwc-fg: var(--aui-ink, #141416);
-  --trwc-muted: var(--aui-muted, #52525b);
-  --trwc-subtle: var(--aui-muted, #6e7076);
-  --trwc-border: var(--aui-border, rgba(20, 20, 22, 0.08));
-  --trwc-hairline: var(--aui-border, rgba(20, 20, 22, 0.055));
-  --trwc-guide: var(--aui-border-strong, rgba(20, 20, 22, 0.12));
-  --trwc-hover: var(--aui-subtle, rgba(20, 20, 22, 0.035));
-  --trwc-accent: var(--aui-blue, #0070f3);
-  --trwc-focus: var(--aui-focus, #0070f3);
+  --trwc-muted: var(--aui-muted, #63636b);
+  --trwc-subtle: var(--aui-muted, #787882);
+  --trwc-border: var(--aui-border, rgba(15, 23, 42, 0.08));
+  --trwc-hairline: rgba(15, 23, 42, 0.045);
+  --trwc-guide: rgba(15, 23, 42, 0.09);
+  --trwc-hover: var(--aui-subtle, rgba(15, 23, 42, 0.03));
+  --trwc-accent: var(--aui-blue, #2563eb);
+  --trwc-focus: var(--aui-focus, #2563eb);
   --trwc-mono: var(--aui-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-  --trwc-agent: #475569;
-  --trwc-llm: #7c3aed;
-  --trwc-tool: #0d9488;
-  --trwc-failed: #dc2626;
+
+  --trwc-agent-fg: #475569;
+  --trwc-llm-fg: #7c3aed;
+  --trwc-tool-fg: #0284c7;
+  --trwc-failed-fg: #dc2626;
+  --trwc-warn-fg: #b45309;
+  --trwc-ok-fg: #059669;
+
+  --ui-trwc-agent-bg: rgba(15, 23, 42, 0.045);
+  --ui-trwc-agent-edge: rgba(15, 23, 42, 0.11);
+  --ui-trwc-llm-bg: rgba(124, 58, 237, 0.085);
+  --ui-trwc-llm-edge: rgba(124, 58, 237, 0.24);
+  --ui-trwc-tool-bg: rgba(14, 165, 233, 0.10);
+  --ui-trwc-tool-edge: rgba(14, 165, 233, 0.28);
+  --ui-trwc-failed-bg: rgba(239, 68, 68, 0.105);
+  --ui-trwc-failed-edge: rgba(239, 68, 68, 0.34);
+
   --trwc-slowest-bg: rgba(245, 158, 11, 0.14);
-  --trwc-slowest-fg: #b45309;
+  --trwc-slowest-fg: #d97706;
   --trwc-dialog-bg: var(--trwc-surface);
 
+  container-type: inline-size;
   position: relative;
   background: var(--trwc-bg);
   color: var(--trwc-fg);
@@ -767,10 +900,28 @@ const css = /* css */ `
 }
 
 :where(.dark, [data-theme="dark"]) .ui-trwc {
-  --trwc-agent: #94a3b8;
-  --trwc-llm: #a78bfa;
-  --trwc-tool: #2dd4bf;
-  --trwc-failed: #f87171;
+  --trwc-surface: rgba(255, 255, 255, 0.025);
+  --trwc-hairline: rgba(255, 255, 255, 0.055);
+  --trwc-guide: rgba(255, 255, 255, 0.10);
+  --trwc-hover: rgba(255, 255, 255, 0.035);
+  --trwc-accent: #60a5fa;
+
+  --trwc-agent-fg: #a1a1aa;
+  --trwc-llm-fg: #a78bfa;
+  --trwc-tool-fg: #38bdf8;
+  --trwc-failed-fg: #f87171;
+  --trwc-warn-fg: #fbbf24;
+  --trwc-ok-fg: #34d399;
+
+  --ui-trwc-agent-bg: rgba(255, 255, 255, 0.065);
+  --ui-trwc-agent-edge: rgba(255, 255, 255, 0.13);
+  --ui-trwc-llm-bg: rgba(139, 92, 246, 0.16);
+  --ui-trwc-llm-edge: rgba(167, 139, 250, 0.34);
+  --ui-trwc-tool-bg: rgba(20, 184, 166, 0.14);
+  --ui-trwc-tool-edge: rgba(45, 212, 191, 0.30);
+  --ui-trwc-failed-bg: rgba(248, 113, 113, 0.16);
+  --ui-trwc-failed-edge: rgba(248, 113, 113, 0.38);
+
   --trwc-slowest-bg: rgba(245, 158, 11, 0.22);
   --trwc-slowest-fg: #fbbf24;
   --trwc-dialog-bg: var(--aui-overlay, #202024);
@@ -781,7 +932,7 @@ const css = /* css */ `
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 12px 16px;
+  padding: 13px 16px;
   border-bottom: 1px solid var(--trwc-border);
 }
 
@@ -794,8 +945,16 @@ const css = /* css */ `
 
 .ui-trwc__spark {
   display: inline-flex;
-  color: var(--trwc-muted);
+  color: var(--trwc-accent);
   flex-shrink: 0;
+}
+
+.ui-trwc__spark[data-status="failed"] {
+  color: var(--trwc-failed-fg);
+}
+
+.ui-trwc__spark[data-status="done"] {
+  color: var(--trwc-ok-fg);
 }
 
 .ui-trwc__title {
@@ -821,7 +980,7 @@ const css = /* css */ `
   gap: 6px;
   font-size: 11.5px;
   font-weight: 500;
-  padding: 2px 9px;
+  padding: 2px 10px;
   border-radius: 999px;
   background: var(--trwc-surface);
   color: var(--trwc-muted);
@@ -829,13 +988,18 @@ const css = /* css */ `
 }
 
 .ui-trwc__status[data-status="running"] {
+  background: rgba(14, 165, 233, 0.12);
+  color: var(--trwc-tool-fg);
+}
+
+.ui-trwc__status[data-status="done"] {
   background: rgba(16, 185, 129, 0.12);
-  color: var(--aui-success, #059669);
+  color: var(--trwc-ok-fg);
 }
 
 .ui-trwc__status[data-status="failed"] {
-  background: rgba(220, 38, 38, 0.12);
-  color: var(--trwc-failed);
+  background: rgba(239, 68, 68, 0.11);
+  color: var(--trwc-failed-fg);
 }
 
 .ui-trwc__status-dot {
@@ -860,13 +1024,12 @@ const css = /* css */ `
 .ui-trwc__stat {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 9px 14px;
-  border-right: 1px solid var(--trwc-border);
+  gap: 3px;
+  padding: 11px 15px;
 }
 
-.ui-trwc__stat:last-child {
-  border-right: 0;
+.ui-trwc__stat + .ui-trwc__stat {
+  border-left: 1px solid var(--trwc-hairline);
 }
 
 .ui-trwc__stat-label {
@@ -875,28 +1038,40 @@ const css = /* css */ `
   letter-spacing: 0.06em;
   color: var(--trwc-subtle);
   text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .ui-trwc__stat-val {
   font-family: var(--trwc-mono);
-  font-size: 13px;
+  font-size: 14.5px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   color: var(--trwc-fg);
+  white-space: nowrap;
 }
 
-.ui-trwc__stat-val[data-error="true"] {
-  color: var(--trwc-failed);
+.ui-trwc__stat-val[data-tone="danger"] {
+  color: var(--trwc-failed-fg);
+}
+
+.ui-trwc__stat-val[data-tone="warn"] {
+  color: var(--trwc-warn-fg);
+}
+
+.ui-trwc__stat-val[data-tone="ok"] {
+  color: var(--trwc-ok-fg);
 }
 
 /* Axis Header */
 .ui-trwc__axis-head {
   display: grid;
-  grid-template-columns: 280px minmax(0, 1fr);
+  grid-template-columns: clamp(235px, 35%, 330px) minmax(0, 1fr);
   align-items: center;
-  height: 26px;
+  height: 30px;
   border-bottom: 1px solid var(--trwc-border);
-  background: var(--trwc-surface);
+  background: var(--trwc-bg);
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.05em;
@@ -905,13 +1080,19 @@ const css = /* css */ `
 
 .ui-trwc__col-span {
   padding: 0 14px;
+  height: 100%;
+  display: flex;
+  align-items: center;
   border-right: 1px solid var(--trwc-border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .ui-trwc__col-timeline {
   position: relative;
   height: 100%;
-  margin: 0 76px 0 12px;
+  margin: 0 112px 0 0;
 }
 
 .ui-trwc__tick-label {
@@ -919,10 +1100,14 @@ const css = /* css */ `
   top: 50%;
   transform: translate(-50%, -50%);
   font-family: var(--trwc-mono);
-  font-size: 10px;
+  font-size: 10.5px;
   font-weight: 500;
   color: var(--trwc-subtle);
   white-space: nowrap;
+}
+
+.ui-trwc__tick-label[data-first="true"] {
+  transform: translate(0, -50%);
 }
 
 .ui-trwc__now-head {
@@ -940,20 +1125,16 @@ const css = /* css */ `
 .ui-trwc__body {
   display: flex;
   flex-direction: column;
+  padding: 4px 0;
 }
 
 .ui-trwc__row {
   display: grid;
-  grid-template-columns: 280px minmax(0, 1fr);
+  grid-template-columns: clamp(235px, 35%, 330px) minmax(0, 1fr);
   align-items: center;
-  min-height: 33px;
-  border-bottom: 1px solid var(--trwc-hairline);
+  min-height: 32px;
   cursor: pointer;
   transition: background 120ms ease;
-}
-
-.ui-trwc__row:last-child {
-  border-bottom: 0;
 }
 
 .ui-trwc__row:hover {
@@ -961,7 +1142,7 @@ const css = /* css */ `
 }
 
 .ui-trwc__row[data-selected="true"] {
-  background: color-mix(in srgb, var(--trwc-accent) 8%, transparent);
+  background: color-mix(in srgb, var(--trwc-accent) 7%, transparent);
 }
 
 .ui-trwc__row:focus-visible {
@@ -974,7 +1155,7 @@ const css = /* css */ `
   display: flex;
   align-items: center;
   gap: 6px;
-  height: 100%;
+  height: 32px;
   padding-right: 10px;
   border-right: 1px solid var(--trwc-border);
   min-width: 0;
@@ -1010,7 +1191,7 @@ const css = /* css */ `
 }
 
 .ui-trwc__chev-spacer {
-  width: 16px;
+  width: 14px;
   height: 16px;
   flex-shrink: 0;
 }
@@ -1019,27 +1200,22 @@ const css = /* css */ `
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 5px;
+  width: 16px;
+  height: 16px;
   flex-shrink: 0;
-  background: rgba(71, 85, 105, 0.14);
-  color: var(--trwc-agent);
+  color: var(--trwc-agent-fg);
 }
 
 .ui-trwc__kind-icon[data-kind="llm"] {
-  background: rgba(124, 58, 237, 0.14);
-  color: var(--trwc-llm);
+  color: var(--trwc-llm-fg);
 }
 
 .ui-trwc__kind-icon[data-kind="tool"] {
-  background: rgba(13, 148, 136, 0.14);
-  color: var(--trwc-tool);
+  color: var(--trwc-tool-fg);
 }
 
 .ui-trwc__kind-icon[data-status="failed"] {
-  background: rgba(220, 38, 38, 0.14);
-  color: var(--trwc-failed);
+  color: var(--trwc-failed-fg);
 }
 
 .ui-trwc__name {
@@ -1049,6 +1225,12 @@ const css = /* css */ `
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.ui-trwc__row[data-parent="true"] .ui-trwc__name {
+  font-weight: 600;
 }
 
 .ui-trwc__detail {
@@ -1057,6 +1239,8 @@ const css = /* css */ `
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  flex: 1 999 0;
+  min-width: 0;
 }
 
 .ui-trwc__spinner {
@@ -1073,8 +1257,8 @@ const css = /* css */ `
 /* Right Timeline Cell */
 .ui-trwc__cell-timeline {
   position: relative;
-  height: 33px;
-  margin: 0 76px 0 12px;
+  height: 32px;
+  margin: 0 112px 0 0;
   display: flex;
   align-items: center;
 }
@@ -1092,16 +1276,15 @@ const css = /* css */ `
   position: absolute;
   top: 0;
   bottom: 0;
-  width: 1.5px;
-  background: var(--trwc-accent);
-  opacity: 0.65;
+  width: 1px;
+  background: color-mix(in srgb, var(--trwc-accent) 45%, transparent);
   pointer-events: none;
   z-index: 2;
 }
 
 .ui-trwc__bar-wrap {
   position: absolute;
-  height: 10px;
+  height: 17px;
   display: flex;
   align-items: center;
   z-index: 1;
@@ -1109,51 +1292,88 @@ const css = /* css */ `
 
 .ui-trwc__bar {
   position: relative;
+  box-sizing: border-box;
   width: 100%;
-  height: 8px;
-  border-radius: 4px;
-  background: var(--trwc-agent);
+  height: 17px;
+  border-radius: 5px;
+  background: var(--ui-trwc-agent-bg);
+  border: 1px solid var(--ui-trwc-agent-edge);
   overflow: hidden;
-  transition: width 120ms linear;
+  transform-origin: left center;
+  animation: ui-trwc-bar-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  transition: width 160ms ease, background-color 140ms ease, border-color 140ms ease;
 }
 
 .ui-trwc__bar[data-kind="llm"] {
-  background: var(--trwc-llm);
+  background: var(--ui-trwc-llm-bg);
+  border-color: var(--ui-trwc-llm-edge);
 }
 
 .ui-trwc__bar[data-kind="tool"] {
-  background: var(--trwc-tool);
+  background: var(--ui-trwc-tool-bg);
+  border-color: var(--ui-trwc-tool-edge);
 }
 
 .ui-trwc__bar[data-status="failed"] {
-  background: var(--trwc-failed);
+  background: var(--ui-trwc-failed-bg);
+  border-color: var(--ui-trwc-failed-edge);
 }
 
-.ui-trwc__bar[data-status="running"] {
-  background-image: linear-gradient(
+.ui-trwc__bar[data-status="running"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
     90deg,
     rgba(255, 255, 255, 0) 0%,
-    rgba(255, 255, 255, 0.35) 50%,
+    rgba(255, 255, 255, 0.42) 50%,
     rgba(255, 255, 255, 0) 100%
   );
   background-size: 200% 100%;
-  animation: ui-trwc-shimmer 1.4s linear infinite;
+  animation: ui-trwc-shimmer 1.6s linear infinite;
+  pointer-events: none;
+}
+
+:where(.dark, [data-theme="dark"]) .ui-trwc__bar[data-status="running"]::after {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 0%,
+    rgba(255, 255, 255, 0.16) 50%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  background-size: 200% 100%;
 }
 
 .ui-trwc__fold-tick {
   position: absolute;
-  top: 1px;
-  bottom: 1px;
-  width: 2px;
-  border-radius: 1px;
-  background: rgba(255, 255, 255, 0.78);
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--trwc-agent-fg);
+  opacity: 0.36;
+}
+
+.ui-trwc__fold-tick[data-kind="llm"] {
+  background: var(--trwc-llm-fg);
+}
+
+.ui-trwc__fold-tick[data-kind="tool"] {
+  background: var(--trwc-tool-fg);
+}
+
+.ui-trwc__bar[data-status="failed"] .ui-trwc__fold-tick,
+.ui-trwc__fold-tick[data-status="failed"] {
+  background: var(--trwc-failed-fg);
+  opacity: 0.42;
 }
 
 .ui-trwc__bar-meta {
   position: absolute;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   white-space: nowrap;
   font-family: var(--trwc-mono);
   font-size: 11px;
@@ -1166,6 +1386,7 @@ const css = /* css */ `
   font-weight: 500;
 }
 
+.ui-trwc__bar-sep,
 .ui-trwc__bar-cost {
   color: var(--trwc-subtle);
 }
@@ -1174,8 +1395,9 @@ const css = /* css */ `
   font-family: var(--aui-font, sans-serif);
   font-size: 9px;
   font-weight: 700;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.04em;
   padding: 1px 5px;
+  margin-left: 2px;
   border-radius: 4px;
   background: var(--trwc-slowest-bg);
   color: var(--trwc-slowest-fg);
@@ -1185,10 +1407,11 @@ const css = /* css */ `
 .ui-trwc__dialog {
   border-top: 1px solid var(--trwc-border);
   background: var(--trwc-dialog-bg);
-  padding: 12px 16px;
+  padding: 13px 16px;
   display: flex;
   flex-direction: column;
   gap: 8px;
+  animation: ui-trwc-dialog-in 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 .ui-trwc__dialog-head {
@@ -1203,6 +1426,7 @@ const css = /* css */ `
   align-items: center;
   gap: 8px;
   min-width: 0;
+  flex-wrap: wrap;
 }
 
 .ui-trwc__dialog-title {
@@ -1212,7 +1436,7 @@ const css = /* css */ `
 }
 
 .ui-trwc__dialog-badge {
-  font-size: 9.5px;
+  font-size: 10px;
   font-weight: 600;
   padding: 1px 6px;
   border-radius: 4px;
@@ -1227,13 +1451,15 @@ const css = /* css */ `
 }
 
 .ui-trwc__dialog-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
   border: 0;
   background: transparent;
   color: var(--trwc-muted);
-  font-size: 16px;
-  line-height: 1;
-  padding: 2px 6px;
-  border-radius: 4px;
+  border-radius: 5px;
   cursor: pointer;
 }
 
@@ -1262,8 +1488,8 @@ const css = /* css */ `
 }
 
 .ui-trwc__dialog-block--error {
-  border-color: rgba(220, 38, 38, 0.35);
-  background: rgba(220, 38, 38, 0.06);
+  border-color: rgba(239, 68, 68, 0.34);
+  background: rgba(239, 68, 68, 0.06);
 }
 
 .ui-trwc__dialog-label {
@@ -1283,13 +1509,49 @@ const css = /* css */ `
   color: var(--trwc-fg);
 }
 
-@media (max-width: 720px) {
+@container (max-width: 560px) {
   .ui-trwc__stats {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
-  .ui-trwc__axis-head,
+  .ui-trwc__stat:nth-child(4) {
+    border-left: 0;
+  }
+  .ui-trwc__stat:nth-child(-n+3) {
+    border-bottom: 1px solid var(--trwc-hairline);
+  }
+  .ui-trwc__axis-head {
+    display: none;
+  }
   .ui-trwc__row {
-    grid-template-columns: 190px minmax(0, 1fr);
+    grid-template-columns: 1fr;
+    padding: 6px 12px 8px;
+    gap: 5px;
+    border-bottom: 1px solid var(--trwc-hairline);
+  }
+  .ui-trwc__cell-span {
+    height: auto;
+    border-right: 0;
+    padding-right: 0;
+    padding-left: 0 !important;
+  }
+  .ui-trwc__guide {
+    display: none;
+  }
+  .ui-trwc__cell-timeline {
+    height: 20px;
+    margin: 0 96px 0 0;
+  }
+}
+
+@container (max-width: 440px) {
+  .ui-trwc__subtitle {
+    display: none;
+  }
+}
+
+@container (max-width: 360px) {
+  .ui-trwc__detail {
+    display: none;
   }
 }
 
@@ -1305,5 +1567,26 @@ const css = /* css */ `
 @keyframes ui-trwc-shimmer {
   0% { background-position: 200% 0; }
   100% { background-position: -200% 0; }
+}
+
+@keyframes ui-trwc-bar-in {
+  from { transform: scaleX(0.85); opacity: 0.5; }
+  to { transform: scaleX(1); opacity: 1; }
+}
+
+@keyframes ui-trwc-dialog-in {
+  from { transform: translateY(-4px) scale(0.99); opacity: 0; }
+  to { transform: translateY(0) scale(1); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-trwc__bar,
+  .ui-trwc__dialog,
+  .ui-trwc__status[data-status="running"] .ui-trwc__status-dot,
+  .ui-trwc__bar[data-status="running"]::after,
+  .ui-trwc__spinner {
+    animation: none !important;
+    transition: none !important;
+  }
 }
 `;
