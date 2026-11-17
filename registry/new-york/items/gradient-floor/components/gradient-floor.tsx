@@ -88,8 +88,8 @@ const css = /* css */ `
 .ui-gf {
   --ui-gf-bg: var(--aui-bg, #fafafa);
   position: relative;
-   isolation: isolate;
-  overflow: hidden;
+  isolation: isolate;
+  overflow-x: clip;
   background: var(--ui-gf-bg);
 }
 

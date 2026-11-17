@@ -90,6 +90,12 @@ export function VoiceOrb({
   levelRef.current = level;
 
   const [inView, setInView] = useState(true);
+  const [darkTheme, setDarkTheme] = useState<boolean>(() =>
+    typeof document !== "undefined"
+      ? document.documentElement.classList.contains("dark") ||
+        document.documentElement.getAttribute("data-theme") === "dark"
+      : false,
+  );
 
   // Fibonacci sphere points + ring angles
   const points = useMemo(() => {
@@ -129,6 +135,21 @@ export function VoiceOrb({
   }, [dots]);
 
   useEffect(() => {
+    const root = document.documentElement;
+    const sync = () => {
+      setDarkTheme(
+        root.classList.contains("dark") ||
+          root.getAttribute("data-theme") === "dark",
+      );
+    };
+    sync();
+    if (typeof MutationObserver === "undefined") return;
+    const mo = new MutationObserver(sync);
+    mo.observe(root, { attributes: true, attributeFilter: ["class", "data-theme"] });
+    return () => mo.disconnect();
+  }, []);
+
+  useEffect(() => {
     const el = stageRef.current;
     if (!el || typeof IntersectionObserver === "undefined") return;
     const io = new IntersectionObserver(
@@ -155,10 +176,7 @@ export function VoiceOrb({
       window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
     const accentRgb = parseHexToRgb(accent);
-    const isDark =
-      document.documentElement.classList.contains("dark") ||
-      document.documentElement.getAttribute("data-theme") === "dark";
-    const baseRgb: [number, number, number] = isDark ? [161, 161, 170] : [82, 82, 91];
+    const baseRgb: [number, number, number] = darkTheme ? [161, 161, 170] : [82, 82, 91];
 
     // Blended weights for each state
     const weights = {
@@ -388,7 +406,7 @@ export function VoiceOrb({
       window.cancelAnimationFrame(rafId);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [size, points, accent, interactive, inView]);
+  }, [size, points, accent, interactive, inView, darkTheme]);
 
   const statusText =
     typeof label === "object" && label !== null
@@ -475,7 +493,7 @@ const css = /* css */ `
   border: 0;
   padding: 0;
   font-family: var(--aui-font, -apple-system, BlinkMacSystemFont, "Inter", sans-serif);
-  color: var(--aui-fg, #09090b);
+  color: var(--aui-ink, #09090b);
   user-select: none;
 }
 
@@ -494,7 +512,7 @@ button.ui-vorb:active {
 }
 
 button.ui-vorb:focus-visible {
-  outline: 2px solid var(--aui-accent, #0070f3);
+  outline: 2px solid var(--aui-focus, #0070f3);
   outline-offset: 4px;
 }
 
@@ -523,7 +541,7 @@ button.ui-vorb:focus-visible {
   color: var(--aui-muted, #52525b);
   padding: 3px 9px;
   border-radius: 999px;
-  background: var(--aui-surface, rgba(24, 24, 27, 0.04));
+  background: var(--aui-subtle, rgba(24, 24, 27, 0.04));
   border: 1px solid var(--aui-border, rgba(24, 24, 27, 0.08));
 }
 

@@ -98,7 +98,7 @@ const css = /* css */ `
 }
 
 .ui-gt__base {
-  color: var(--aui-fg, #09090b);
+  color: var(--aui-ink, #09090b);
   transition: opacity 700ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 

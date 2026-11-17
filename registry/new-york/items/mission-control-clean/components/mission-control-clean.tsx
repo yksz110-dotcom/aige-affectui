@@ -67,6 +67,8 @@ export type MissionControlProps = {
   onReject?: (agent: MissionAgent) => void;
   onRetry?: (agent: MissionAgent) => void;
   onDismiss?: (agent: MissionAgent) => void;
+  /** Formats a cost number – defaults to USD ("$12.34") */
+  formatCost?: (amount: number) => string;
   /** Heading in the top bar */
   title?: string;
   className?: string;
@@ -111,6 +113,7 @@ export function MissionControl({
   onReject,
   onRetry,
   onDismiss,
+  formatCost = (amount: number) => `$${amount.toFixed(2)}`,
   title = "Mission control",
   className,
 }: MissionControlProps) {
@@ -317,7 +320,7 @@ export function MissionControl({
           <span className="ui-mcc__live-dot" data-active={hasRunning || undefined} />
           <h3 className="ui-mcc__title">{title}</h3>
           <span className="ui-mcc__meta">
-            {allAgents.length} agents · ${totalCost.toFixed(2)}
+            {allAgents.length} agents · {formatCost(totalCost)}
           </span>
         </div>
 
@@ -382,15 +385,15 @@ export function MissionControl({
           >
             <defs>
               <linearGradient id="ui-mcc-area-grad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="var(--aui-accent, #0070f3)" stopOpacity="0.16" />
-                <stop offset="100%" stopColor="var(--aui-accent, #0070f3)" stopOpacity="0.0" />
+                <stop offset="0%" stopColor="var(--mcc-accent, #0070f3)" stopOpacity="0.16" />
+                <stop offset="100%" stopColor="var(--mcc-accent, #0070f3)" stopOpacity="0.0" />
               </linearGradient>
             </defs>
             <path d={curveData.area} fill="url(#ui-mcc-area-grad)" />
             <path
               d={curveData.line}
               fill="none"
-              stroke="var(--aui-accent, #0070f3)"
+              stroke="var(--mcc-accent, #0070f3)"
               strokeWidth="1.6"
               strokeOpacity="0.65"
             />
@@ -492,7 +495,7 @@ export function MissionControl({
                         <span className="ui-mcc__timer">{formatElapsed(elapsedSec)}</span>
                       )}
                       {typeof lead.cost === "number" && (
-                        <span className="ui-mcc__cost">${lead.cost.toFixed(2)}</span>
+                        <span className="ui-mcc__cost">{formatCost(lead.cost)}</span>
                       )}
                       <span className="ui-mcc__badge" data-status={lead.status}>
                         {lead.status === "waiting" ? "Needs you" : lead.status}
@@ -530,7 +533,7 @@ export function MissionControl({
                                 </span>
                               )}
                               {typeof sub.cost === "number" && (
-                                <span className="ui-mcc__cost">${sub.cost.toFixed(2)}</span>
+                                <span className="ui-mcc__cost">{formatCost(sub.cost)}</span>
                               )}
                               <span className="ui-mcc__badge" data-status={sub.status}>
                                 {sub.status === "waiting" ? "Needs you" : sub.status}
@@ -653,21 +656,29 @@ export function MissionControl({
 
 const css = /* css */ `
 .ui-mcc {
-  --mcc-bg: var(--aui-bg, #ffffff);
-  --mcc-surface: var(--aui-surface, #f6f6f7);
-  --mcc-fg: var(--aui-fg, #141416);
-  --mcc-muted: var(--aui-muted, #63636b);
-  --mcc-subtle: var(--aui-subtle, #8a8a93);
+  --mcc-bg: var(--aui-surface, #ffffff);
+  --mcc-surface: var(--aui-subtle, rgba(20, 20, 22, 0.045));
+  --mcc-fg: var(--aui-ink, #141416);
+  --mcc-muted: var(--aui-muted, #52525b);
+  --mcc-subtle: var(--aui-muted, #6e7076);
   --mcc-border: var(--aui-border, rgba(20, 20, 22, 0.08));
-  --mcc-accent: var(--aui-accent, #0070f3);
+  --mcc-hover: var(--aui-subtle, rgba(20, 20, 22, 0.06));
+  --mcc-accent: var(--aui-blue, #0070f3);
+  --mcc-focus: var(--aui-focus, #0070f3);
+  --mcc-mono: var(--aui-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
 
   background: var(--mcc-bg);
   color: var(--mcc-fg);
-  border-radius: var(--aui-radius, 14px);
+  border-radius: var(--aui-radius-lg, var(--aui-radius, 14px));
   box-shadow: var(--aui-shadow-card, 0 0 0 1px rgba(15, 23, 42, 0.07), 0 1px 2px rgba(15, 23, 42, 0.04), 0 8px 24px -8px rgba(15, 23, 42, 0.06));
   font-family: var(--aui-font, -apple-system, BlinkMacSystemFont, "Inter", sans-serif);
   font-size: 12.5px;
   overflow: hidden;
+}
+
+:where(.dark, [data-theme="dark"]) .ui-mcc {
+  --mcc-surface: rgba(255, 255, 255, 0.055);
+  --mcc-hover: rgba(255, 255, 255, 0.085);
 }
 
 .ui-mcc__top {
@@ -703,12 +714,13 @@ const css = /* css */ `
   font-size: 13.5px;
   font-weight: 600;
   letter-spacing: -0.01em;
+  color: var(--mcc-fg);
 }
 
 .ui-mcc__meta {
-  font-family: var(--aui-mono, monospace);
+  font-family: var(--mcc-mono);
   font-size: 11.5px;
-  color: var(--mcc-subtle);
+  color: var(--mcc-muted);
 }
 
 .ui-mcc__filters {
@@ -741,16 +753,30 @@ const css = /* css */ `
   color: var(--mcc-fg);
 }
 
+.ui-mcc__filter-btn:focus-visible,
+.ui-mcc__peak-btn:focus-visible,
+.ui-mcc__inbox-toggle:focus-visible,
+.ui-mcc__btn:focus-visible {
+  outline: 2px solid var(--mcc-focus);
+  outline-offset: 2px;
+}
+
 .ui-mcc__filter-btn[data-checked="true"] {
   background: var(--mcc-bg);
   color: var(--mcc-fg);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
 }
 
+:where(.dark, [data-theme="dark"]) .ui-mcc__filter-btn[data-checked="true"] {
+  background: var(--aui-overlay, #27272a);
+  color: var(--mcc-fg);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
 .ui-mcc__filter-count {
-  font-family: var(--aui-mono, monospace);
+  font-family: var(--mcc-mono);
   font-size: 10.5px;
-  color: var(--mcc-subtle);
+  color: var(--mcc-muted);
 }
 
 /* Recap Curve */
@@ -794,7 +820,7 @@ const css = /* css */ `
 }
 
 .ui-mcc__recap-time {
-  font-family: var(--aui-mono, monospace);
+  font-family: var(--mcc-mono);
   font-size: 10.5px;
   color: var(--mcc-subtle);
 }
@@ -816,7 +842,7 @@ const css = /* css */ `
   transform: translate(-50%, -50%);
   display: inline-flex;
   align-items: center;
-   gap: 3px;
+  gap: 3px;
   padding: 3px;
   border: 0;
   border-radius: 999px;
@@ -851,7 +877,7 @@ const css = /* css */ `
 }
 
 .ui-mcc__peak-count {
-  font-family: var(--aui-mono, monospace);
+  font-family: var(--mcc-mono);
   font-size: 9.5px;
   font-weight: 600;
   padding: 0 3px;
@@ -872,6 +898,13 @@ const css = /* css */ `
 
 .ui-mcc__fleet {
   border-right: 1px solid var(--mcc-border);
+}
+
+@media (max-width: 820px) {
+  .ui-mcc__fleet {
+    border-right: 0;
+    border-bottom: 1px solid var(--mcc-border);
+  }
 }
 
 .ui-mcc__section-head {
@@ -906,7 +939,7 @@ const css = /* css */ `
 }
 
 .ui-mcc__lead-group[data-spotlight="true"] {
-  background: rgba(0, 112, 243, 0.035);
+  background: color-mix(in srgb, var(--mcc-accent) 6%, transparent);
 }
 
 .ui-mcc__agent-row {
@@ -962,12 +995,12 @@ const css = /* css */ `
 }
 
 .ui-mcc__model {
-  font-family: var(--aui-mono, monospace);
+  font-family: var(--mcc-mono);
   font-size: 10.5px;
   padding: 1px 5px;
   border-radius: 4px;
   background: var(--mcc-surface);
-  color: var(--mcc-subtle);
+  color: var(--mcc-muted);
   flex-shrink: 0;
 }
 
@@ -991,7 +1024,7 @@ const css = /* css */ `
 }
 
 .ui-mcc__tool-chip {
-  font-family: var(--aui-mono, monospace);
+  font-family: var(--mcc-mono);
   font-size: 10px;
   padding: 1px 5px;
   border-radius: 4px;
@@ -1001,7 +1034,7 @@ const css = /* css */ `
 
 .ui-mcc__timer,
 .ui-mcc__cost {
-  font-family: var(--aui-mono, monospace);
+  font-family: var(--mcc-mono);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   color: var(--mcc-subtle);
@@ -1018,7 +1051,7 @@ const css = /* css */ `
 }
 
 .ui-mcc__badge[data-status="running"] {
-  background: rgba(0, 112, 243, 0.1);
+  background: rgba(0, 112, 243, 0.12);
   color: #0070f3;
 }
 
@@ -1028,13 +1061,26 @@ const css = /* css */ `
 }
 
 .ui-mcc__badge[data-status="failed"] {
-  background: rgba(239, 68, 68, 0.12);
+  background: rgba(239, 68, 68, 0.14);
   color: #dc2626;
 }
 
 .ui-mcc__badge[data-status="done"] {
-  background: rgba(16, 185, 129, 0.12);
+  background: rgba(16, 185, 129, 0.14);
   color: #059669;
+}
+
+:where(.dark, [data-theme="dark"]) .ui-mcc__badge[data-status="running"] {
+  color: #60a5fa;
+}
+:where(.dark, [data-theme="dark"]) .ui-mcc__badge[data-status="waiting"] {
+  color: #fbbf24;
+}
+:where(.dark, [data-theme="dark"]) .ui-mcc__badge[data-status="failed"] {
+  color: #f87171;
+}
+:where(.dark, [data-theme="dark"]) .ui-mcc__badge[data-status="done"] {
+  color: #34d399;
 }
 
 .ui-mcc__sub-list {
@@ -1121,7 +1167,7 @@ const css = /* css */ `
   padding: 0;
   border: 0;
   background: transparent;
-  color: inherit;
+  color: var(--mcc-fg);
   font-family: inherit;
   font-size: 12px;
   text-align: left;
@@ -1131,6 +1177,7 @@ const css = /* css */ `
 .ui-mcc__inbox-name {
   flex: 1;
   font-weight: 600;
+  color: var(--mcc-fg);
 }
 
 .ui-mcc__inbox-prompt {
@@ -1145,7 +1192,7 @@ const css = /* css */ `
   padding: 6px 8px;
   border-radius: 6px;
   background: var(--mcc-surface);
-  font-family: var(--aui-mono, monospace);
+  font-family: var(--mcc-mono);
   font-size: 11px;
   color: var(--mcc-muted);
   display: flex;
@@ -1172,17 +1219,17 @@ const css = /* css */ `
 }
 
 .ui-mcc__btn:hover {
-  background: rgba(20, 20, 22, 0.06);
+  background: var(--mcc-hover);
 }
 
 .ui-mcc__btn--primary {
-  background: var(--mcc-fg);
-  color: var(--mcc-bg);
-  border-color: var(--mcc-fg);
+  background: var(--aui-primary, var(--mcc-fg));
+  color: var(--aui-on-primary, var(--mcc-bg));
+  border-color: var(--aui-primary, var(--mcc-fg));
 }
 
 .ui-mcc__btn--primary:hover {
   opacity: 0.9;
-  background: var(--mcc-fg);
+  background: var(--aui-primary, var(--mcc-fg));
 }
 `;

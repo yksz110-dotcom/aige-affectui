@@ -58,6 +58,8 @@ export type TraceWaterfallProps = {
   minRange?: number;
   /** Formats a cost number – defaults to USD ("$0.042") */
   formatCost?: (amount: number) => string;
+  /** Formats a duration in ms – defaults to "800ms", "1.2s", "2m 04s" */
+  formatDuration?: (ms: number) => string;
   /** Heading in the top bar */
   title?: string;
   className?: string;
@@ -78,7 +80,7 @@ function defaultFormatCost(amount: number): string {
   return `$${amount.toFixed(2)}`;
 }
 
-function formatDuration(ms: number): string {
+function defaultFormatDuration(ms: number): string {
   const safe = Math.max(0, ms);
   if (safe < 1000) return `${Math.round(safe)}ms`;
   const sec = safe / 1000;
@@ -115,9 +117,11 @@ export function TraceWaterfall({
   markSlowest = true,
   minRange = 10000,
   formatCost = defaultFormatCost,
+  formatDuration: customFormatDuration,
   title = "Trace",
   className,
 }: TraceWaterfallProps) {
+  const fmtDuration = customFormatDuration ?? defaultFormatDuration;
   const [internalCollapsed, setInternalCollapsed] = useState<string[]>(defaultCollapsed);
   const [internalOpenId, setInternalOpenId] = useState<string | null>(defaultOpenId);
   const [focusId, setFocusId] = useState<string>(root.id);
@@ -373,7 +377,7 @@ export function TraceWaterfall({
       <div className="ui-trwc__stats">
         <div className="ui-trwc__stat">
           <span className="ui-trwc__stat-label">DURATION</span>
-          <span className="ui-trwc__stat-val">{formatDuration(summary.duration)}</span>
+          <span className="ui-trwc__stat-val">{fmtDuration(summary.duration)}</span>
         </div>
         <div className="ui-trwc__stat">
           <span className="ui-trwc__stat-label">COST</span>
@@ -414,7 +418,7 @@ export function TraceWaterfall({
                 className="ui-trwc__tick-label"
                 style={{ left: `${pct}%` }}
               >
-                {tick === 0 ? "0s" : formatDuration(tick)}
+                {tick === 0 && !customFormatDuration ? "0s" : fmtDuration(tick)}
               </span>
             );
           })}
@@ -589,7 +593,7 @@ export function TraceWaterfall({
                   className="ui-trwc__bar-meta"
                   style={{ left: `calc(${leftPct + widthPct}% + 8px)` }}
                 >
-                  <span className="ui-trwc__bar-dur">{formatDuration(durMs)}</span>
+                  <span className="ui-trwc__bar-dur">{fmtDuration(durMs)}</span>
                   {typeof span.cost === "number" && span.cost > 0 && (
                     <span className="ui-trwc__bar-cost">{formatCost(span.cost)}</span>
                   )}
@@ -641,7 +645,7 @@ export function TraceWaterfall({
             <span>
               Duration:{" "}
               <strong>
-                {formatDuration((openSpan.end ?? effectiveNow) - openSpan.start)}
+                {fmtDuration((openSpan.end ?? effectiveNow) - openSpan.start)}
               </strong>
             </span>
             {typeof openSpan.cost === "number" && (
@@ -732,39 +736,44 @@ function KindGlyph({ kind, status }: { kind: TraceSpanKind; status: TraceSpanSta
 
 const css = /* css */ `
 .ui-trwc {
-  --trwc-bg: var(--aui-bg, #ffffff);
-  --trwc-surface: var(--aui-surface, #f6f6f7);
-  --trwc-fg: var(--aui-fg, #141416);
-  --trwc-muted: var(--aui-muted, #63636b);
-  --trwc-subtle: var(--aui-subtle, #8a8a93);
-  --trwc-faint: var(--aui-faint, #b4b4bc);
+  --trwc-bg: var(--aui-surface, #ffffff);
+  --trwc-surface: var(--aui-subtle, rgba(20, 20, 22, 0.04));
+  --trwc-fg: var(--aui-ink, #141416);
+  --trwc-muted: var(--aui-muted, #52525b);
+  --trwc-subtle: var(--aui-muted, #6e7076);
   --trwc-border: var(--aui-border, rgba(20, 20, 22, 0.08));
-  --trwc-accent: var(--aui-accent, #0070f3);
+  --trwc-hairline: var(--aui-border, rgba(20, 20, 22, 0.055));
+  --trwc-guide: var(--aui-border-strong, rgba(20, 20, 22, 0.12));
+  --trwc-hover: var(--aui-subtle, rgba(20, 20, 22, 0.035));
+  --trwc-accent: var(--aui-blue, #0070f3);
+  --trwc-focus: var(--aui-focus, #0070f3);
+  --trwc-mono: var(--aui-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   --trwc-agent: #475569;
   --trwc-llm: #7c3aed;
   --trwc-tool: #0d9488;
   --trwc-failed: #dc2626;
   --trwc-slowest-bg: rgba(245, 158, 11, 0.14);
   --trwc-slowest-fg: #b45309;
+  --trwc-dialog-bg: var(--trwc-surface);
 
   position: relative;
   background: var(--trwc-bg);
   color: var(--trwc-fg);
-  border-radius: var(--aui-radius, 14px);
+  border-radius: var(--aui-radius-lg, var(--aui-radius, 14px));
   box-shadow: var(--aui-shadow-card, 0 0 0 1px rgba(15, 23, 42, 0.07), 0 1px 2px rgba(15, 23, 42, 0.04), 0 8px 24px -8px rgba(15, 23, 42, 0.06));
   font-family: var(--aui-font, -apple-system, BlinkMacSystemFont, "Inter", sans-serif);
   font-size: 12.5px;
   overflow: hidden;
 }
 
-.dark .ui-trwc,
-[data-theme="dark"] .ui-trwc {
+:where(.dark, [data-theme="dark"]) .ui-trwc {
   --trwc-agent: #94a3b8;
   --trwc-llm: #a78bfa;
   --trwc-tool: #2dd4bf;
   --trwc-failed: #f87171;
-  --trwc-slowest-bg: rgba(245, 158, 11, 0.2);
+  --trwc-slowest-bg: rgba(245, 158, 11, 0.22);
   --trwc-slowest-fg: #fbbf24;
+  --trwc-dialog-bg: var(--aui-overlay, #202024);
 }
 
 .ui-trwc__top {
@@ -795,7 +804,7 @@ const css = /* css */ `
   font-weight: 600;
   letter-spacing: -0.01em;
   color: var(--trwc-fg);
-   flex-shrink: 0;
+  flex-shrink: 0;
 }
 
 .ui-trwc__subtitle {
@@ -820,12 +829,12 @@ const css = /* css */ `
 }
 
 .ui-trwc__status[data-status="running"] {
-  background: rgba(16, 185, 129, 0.1);
-  color: #059669;
+  background: rgba(16, 185, 129, 0.12);
+  color: var(--aui-success, #059669);
 }
 
 .ui-trwc__status[data-status="failed"] {
-  background: rgba(220, 38, 38, 0.1);
+  background: rgba(220, 38, 38, 0.12);
   color: var(--trwc-failed);
 }
 
@@ -869,7 +878,7 @@ const css = /* css */ `
 }
 
 .ui-trwc__stat-val {
-  font-family: var(--aui-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-family: var(--trwc-mono);
   font-size: 13px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
@@ -909,7 +918,7 @@ const css = /* css */ `
   position: absolute;
   top: 50%;
   transform: translate(-50%, -50%);
-  font-family: var(--aui-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-family: var(--trwc-mono);
   font-size: 10px;
   font-weight: 500;
   color: var(--trwc-subtle);
@@ -938,7 +947,7 @@ const css = /* css */ `
   grid-template-columns: 280px minmax(0, 1fr);
   align-items: center;
   min-height: 33px;
-  border-bottom: 1px solid rgba(20, 20, 22, 0.045);
+  border-bottom: 1px solid var(--trwc-hairline);
   cursor: pointer;
   transition: background 120ms ease;
 }
@@ -948,15 +957,15 @@ const css = /* css */ `
 }
 
 .ui-trwc__row:hover {
-  background: rgba(20, 20, 22, 0.025);
+  background: var(--trwc-hover);
 }
 
 .ui-trwc__row[data-selected="true"] {
-  background: rgba(0, 112, 243, 0.055);
+  background: color-mix(in srgb, var(--trwc-accent) 8%, transparent);
 }
 
 .ui-trwc__row:focus-visible {
-  outline: 2px solid var(--trwc-accent);
+  outline: 2px solid var(--trwc-focus);
   outline-offset: -2px;
 }
 
@@ -977,7 +986,7 @@ const css = /* css */ `
   top: 0;
   bottom: 0;
   width: 1px;
-  background: rgba(20, 20, 22, 0.08);
+  background: var(--trwc-guide);
 }
 
 .ui-trwc__chev {
@@ -996,7 +1005,7 @@ const css = /* css */ `
 }
 
 .ui-trwc__chev:hover {
-  background: rgba(20, 20, 22, 0.06);
+  background: var(--trwc-hover);
   color: var(--trwc-fg);
 }
 
@@ -1014,22 +1023,22 @@ const css = /* css */ `
   height: 18px;
   border-radius: 5px;
   flex-shrink: 0;
-  background: rgba(71, 85, 105, 0.1);
+  background: rgba(71, 85, 105, 0.14);
   color: var(--trwc-agent);
 }
 
 .ui-trwc__kind-icon[data-kind="llm"] {
-  background: rgba(124, 58, 237, 0.11);
+  background: rgba(124, 58, 237, 0.14);
   color: var(--trwc-llm);
 }
 
 .ui-trwc__kind-icon[data-kind="tool"] {
-  background: rgba(13, 148, 136, 0.11);
+  background: rgba(13, 148, 136, 0.14);
   color: var(--trwc-tool);
 }
 
 .ui-trwc__kind-icon[data-status="failed"] {
-  background: rgba(220, 38, 38, 0.12);
+  background: rgba(220, 38, 38, 0.14);
   color: var(--trwc-failed);
 }
 
@@ -1054,7 +1063,7 @@ const css = /* css */ `
   width: 10px;
   height: 10px;
   border-radius: 999px;
-  border: 1.5px solid rgba(0, 112, 243, 0.25);
+  border: 1.5px solid color-mix(in srgb, var(--trwc-accent) 25%, transparent);
   border-top-color: var(--trwc-accent);
   animation: ui-trwc-spin 750ms linear infinite;
   flex-shrink: 0;
@@ -1075,7 +1084,7 @@ const css = /* css */ `
   top: 0;
   bottom: 0;
   width: 1px;
-  background: rgba(20, 20, 22, 0.045);
+  background: var(--trwc-hairline);
   pointer-events: none;
 }
 
@@ -1146,7 +1155,7 @@ const css = /* css */ `
   align-items: center;
   gap: 5px;
   white-space: nowrap;
-  font-family: var(--aui-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-family: var(--trwc-mono);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   z-index: 2;
@@ -1175,7 +1184,7 @@ const css = /* css */ `
 /* Detail Dialog */
 .ui-trwc__dialog {
   border-top: 1px solid var(--trwc-border);
-  background: var(--trwc-surface);
+  background: var(--trwc-dialog-bg);
   padding: 12px 16px;
   display: flex;
   flex-direction: column;
@@ -1207,12 +1216,12 @@ const css = /* css */ `
   font-weight: 600;
   padding: 1px 6px;
   border-radius: 4px;
-  background: rgba(20, 20, 22, 0.07);
+  background: var(--trwc-hover);
   color: var(--trwc-muted);
 }
 
 .ui-trwc__dialog-model {
-  font-family: var(--aui-mono, monospace);
+  font-family: var(--trwc-mono);
   font-size: 11px;
   color: var(--trwc-subtle);
 }
@@ -1229,7 +1238,7 @@ const css = /* css */ `
 }
 
 .ui-trwc__dialog-close:hover {
-  background: rgba(20, 20, 22, 0.08);
+  background: var(--trwc-hover);
   color: var(--trwc-fg);
 }
 
@@ -1241,6 +1250,10 @@ const css = /* css */ `
   color: var(--trwc-muted);
 }
 
+.ui-trwc__dialog-metrics strong {
+  color: var(--trwc-fg);
+}
+
 .ui-trwc__dialog-block {
   background: var(--trwc-bg);
   border: 1px solid var(--trwc-border);
@@ -1249,8 +1262,8 @@ const css = /* css */ `
 }
 
 .ui-trwc__dialog-block--error {
-  border-color: rgba(220, 38, 38, 0.3);
-  background: rgba(220, 38, 38, 0.04);
+  border-color: rgba(220, 38, 38, 0.35);
+  background: rgba(220, 38, 38, 0.06);
 }
 
 .ui-trwc__dialog-label {
@@ -1263,7 +1276,7 @@ const css = /* css */ `
 
 .ui-trwc__dialog-pre {
   margin: 0;
-  font-family: var(--aui-mono, monospace);
+  font-family: var(--trwc-mono);
   font-size: 11.5px;
   white-space: pre-wrap;
   word-break: break-word;
